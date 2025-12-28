@@ -44,9 +44,10 @@ const Indexing = () => {
   }, []);
 
   useEffect(() => {
-    // 当数据库改变时，重置索引模式为该数据库的第一个可用模式
-    setIndexMode(dbConfigs[vectorDb].modes[0]);
-  }, [vectorDb]);
+    // 当数据库提供商改变时，重置索引模式为该数据库的第一个可用模式，并同步vectorDb
+    setIndexMode((dbConfigs[selectedProvider] && dbConfigs[selectedProvider].modes[0]) || 'standard');
+    setVectorDb(selectedProvider);
+  }, [selectedProvider]);
 
   useEffect(() => {
     const fetchData = async () => {
@@ -60,6 +61,7 @@ const Indexing = () => {
         const collectionsResponse = await fetch(`${apiBaseUrl}/collections?provider=${selectedProvider}`);
         const collectionsData = await collectionsResponse.json();
         setCollections(collectionsData.collections);
+        setSelectedCollection('');
       } catch (error) {
         console.error('Error fetching data:', error);
       }
@@ -87,7 +89,7 @@ const Indexing = () => {
 
   const fetchCollections = async () => {
     try {
-      const response = await fetch(`${apiBaseUrl}/collections/${vectorDb}`);
+      const response = await fetch(`${apiBaseUrl}/collections?provider=${selectedProvider}`);
       const data = await response.json();
       setCollections(data.collections || []);
     } catch (error) {
@@ -110,7 +112,7 @@ const Indexing = () => {
         },
         body: JSON.stringify({
           fileId: embeddingFile,
-          vectorDb,
+          vectorDb: selectedProvider,
           indexMode
         }),
       });
@@ -124,6 +126,7 @@ const Indexing = () => {
     }
   };
 
+  // Index Mode Selection uses selectedProvider
   const handleDisplay = async (collectionName) => {
     if (!collectionName) return;
     
@@ -223,7 +226,7 @@ const Indexing = () => {
                 onChange={(e) => setIndexMode(e.target.value)}
                 className="block w-full p-2 border rounded"
               >
-                {dbConfigs[vectorDb].modes.map(mode => (
+                {dbConfigs[selectedProvider].modes.map(mode => (
                   <option key={mode} value={mode}>
                     {mode.toUpperCase()}
                   </option>

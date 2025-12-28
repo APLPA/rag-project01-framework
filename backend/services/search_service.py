@@ -6,6 +6,7 @@ from services.embedding_service import EmbeddingService
 from utils.config import VectorDBProvider, MILVUS_CONFIG
 import os
 import json
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +118,8 @@ class SearchService:
             logger.error(f"Error saving search results: {str(e)}")
             raise
 
-    async def search(self, 
+    async def search(
+                    self,
                     query: str, 
                     collection_id: str, 
                     top_k: int = 3, 
@@ -141,6 +143,7 @@ class SearchService:
         Raises:
             Exception: 搜索过程中发生错误
         """
+        used_milvus = False
         try:
             # 添加参数日志
             logger.info(f"Search parameters:")
@@ -153,13 +156,73 @@ class SearchService:
 
             logger.info(f"Starting search with parameters - Collection: {collection_id}, Query: {query}, Top K: {top_k}")
             
+            # 检测 Chroma 集合文件并执行基于文件的相似度搜索
+            chroma_file = os.path.join("03-vector-store", "chroma", f"{collection_id}.json")
+            if os.path.exists(chroma_file):
+                logger.info(f"Detected Chroma collection file for {collection_id}, performing file-based cosine similarity search")
+                with open(chroma_file, 'r', encoding='utf-8') as f:
+                    chroma_data = json.load(f)
+                emb_provider = chroma_data.get("embedding_provider", "")
+                emb_model = chroma_data.get("embedding_model", "")
+                logger.info(f"Creating query embedding with provider={emb_provider}, model={emb_model}")
+                query_embedding = self.embedding_service.create_single_embedding(
+                    query,
+                    provider=emb_provider,
+                    model=emb_model
+                )
+                def _cosine_similarity(vec1, vec2):
+                    dot = sum(a*b for a,b in zip(vec1, vec2))
+                    norm1 = math.sqrt(sum(a*a for a in vec1))
+                    norm2 = math.sqrt(sum(b*b for b in vec2))
+                    return dot / (norm1 * norm2) if norm1 and norm2 else 0.0
+                processed_results = []
+                records = chroma_data.get("records", [])
+                logger.info(f"Chroma records count: {len(records)}")
+                for rec in records:
+                    try:
+                        wc = int(rec.get("word_count", 0))
+                    except Exception:
+                        wc = 0
+                    if wc < word_count_threshold:
+                        continue
+                    score = _cosine_similarity(query_embedding, rec.get("vector", []))
+                    if score >= threshold:
+                        processed_results.append({
+                            "text": rec.get("content", ""),
+                            "score": float(score),
+                            "metadata": {
+                                "source": rec.get("document_name", ""),
+                                "page": rec.get("page_number", ""),
+                                "chunk": rec.get("chunk_id", 0),
+                                "total_chunks": rec.get("total_chunks", 0),
+                                "page_range": rec.get("page_range", ""),
+                                "embedding_provider": rec.get("embedding_provider", emb_provider),
+                                "embedding_model": rec.get("embedding_model", emb_model),
+                                "embedding_timestamp": rec.get("embedding_timestamp", "")
+                            }
+                        })
+                processed_results.sort(key=lambda x: x["score"], reverse=True)
+                if isinstance(top_k, int) and top_k > 0:
+                    processed_results = processed_results[:top_k]
+                response_data = {"results": processed_results}
+                logger.info(f"Preparing to handle save_results (flag: {save_results})")
+                if save_results and processed_results:
+                    try:
+                        filepath = self.save_search_results(query, collection_id, processed_results)
+                        response_data["saved_filepath"] = filepath
+                    except Exception as e:
+                        logger.error(f"Error saving results: {str(e)}")
+                        response_data["save_error"] = str(e)
+                        raise
+                return response_data
+            
             # 连接到 Milvus
             logger.info(f"Connecting to Milvus at {self.milvus_uri}")
             connections.connect(
                 alias="default",
                 uri=self.milvus_uri
             )
-            
+            used_milvus = True
             # 获取collection
             logger.info(f"Loading collection: {collection_id}")
             collection = Collection(collection_id)
@@ -256,8 +319,6 @@ class SearchService:
                         logger.error(f"Error saving results: {str(e)}")
                         response_data["save_error"] = str(e)
                         raise  # 添加这行来查看完整的错误堆栈
-                else:
-                    logger.info("No results to save")
             else:
                 logger.info("Save results is False, skipping save")
             
@@ -267,4 +328,8 @@ class SearchService:
             logger.error(f"Error performing search: {str(e)}")
             raise
         finally:
-            connections.disconnect("default") 
+            try:
+                if used_milvus:
+                    connections.disconnect("default")
+            except Exception:
+                pass

@@ -62,6 +62,8 @@ class VectorStoreService:
         self.initialized_dbs = {}
         # 确保存储目录存在
         os.makedirs("03-vector-store", exist_ok=True)
+        # 为 Chroma 文件存储准备目录
+        os.makedirs("03-vector-store/chroma", exist_ok=True)
     
     def _get_milvus_index_type(self, config: VectorDBConfig) -> str:
         """
@@ -104,8 +106,10 @@ class VectorStoreService:
         embeddings_data = self._load_embeddings(embedding_file)
         
         # 根据不同的数据库进行索引
-        if config.provider == VectorDBProvider.MILVUS:
+        if config.provider == VectorDBProvider.MILVUS or config.provider == VectorDBProvider.MILVUS.value:
             result = self._index_to_milvus(embeddings_data, config)
+        elif str(config.provider).lower() == "chroma":
+            result = self._index_to_chroma(embeddings_data, config)
         
         end_time = datetime.now()
         processing_time = (end_time - start_time).total_seconds()
@@ -291,7 +295,66 @@ class VectorStoreService:
         finally:
             connections.disconnect("default")
 
-    def list_collections(self, provider: str) -> List[str]:
+    def _index_to_chroma(self, embeddings_data: Dict[str, Any], config: VectorDBConfig) -> Dict[str, Any]:
+        """
+        将嵌入向量索引到 Chroma（文件存储实现）
+        说明：为避免引入额外依赖，这里使用本地 JSON 文件模拟 Chroma 集合存储。
+        """
+        try:
+            # 使用 filename 作为 collection 名称前缀
+            filename = embeddings_data.get("filename", "")
+            base_name = filename.replace('.pdf', '') if filename else "doc"
+            base_name = ''.join(lazy_pinyin(base_name, style=Style.NORMAL)).replace('-', '_')
+            if not base_name[0].isalpha() and base_name[0] != '_':
+                base_name = f"_{base_name}"
+
+            embedding_provider = embeddings_data.get("embedding_provider", "unknown")
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            collection_name = f"{base_name}_{embedding_provider}_{timestamp}"
+
+            # 向量维度
+            vector_dim = int(embeddings_data.get("vector_dimension"))
+            if not vector_dim:
+                raise ValueError("Missing vector_dimension in embedding file")
+
+            # 组织记录数据
+            records = []
+            for emb in embeddings_data["embeddings"]:
+                records.append({
+                    "content": str(emb["metadata"].get("content", "")),
+                    "document_name": embeddings_data.get("filename", ""),
+                    "chunk_id": int(emb["metadata"].get("chunk_id", 0)),
+                    "total_chunks": int(emb["metadata"].get("total_chunks", 0)),
+                    "word_count": int(emb["metadata"].get("word_count", 0)),
+                    "page_number": str(emb["metadata"].get("page_number", 0)),
+                    "page_range": str(emb["metadata"].get("page_range", "")),
+                    "embedding_provider": embeddings_data.get("embedding_provider", ""),
+                    "embedding_model": embeddings_data.get("embedding_model", ""),
+                    "embedding_timestamp": str(emb["metadata"].get("embedding_timestamp", "")),
+                    "vector": [float(x) for x in emb.get("embedding", [])]
+                })
+
+            # 保存到本地 JSON 文件
+            output_path = os.path.join("03-vector-store", "chroma", f"{collection_name}.json")
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "name": collection_name,
+                    "created_at": timestamp,
+                    "vector_dimension": vector_dim,
+                    "embedding_provider": embeddings_data.get("embedding_provider", ""),
+                    "embedding_model": embeddings_data.get("embedding_model", ""),
+                    "records": records
+                }, f, ensure_ascii=False, indent=2)
+
+            return {
+                "index_size": len(records),
+                "collection_name": collection_name
+            }
+        except Exception as e:
+            logger.error(f"Error indexing to Chroma: {str(e)}")
+            raise
+
+    def list_collections(self, provider: str) -> List[Dict[str, Any]]:
         """
         列出指定提供商的所有集合
         
@@ -299,15 +362,51 @@ class VectorStoreService:
             provider: 向量数据库提供商
             
         返回:
-            集合名称列表
+            集合信息列表（包含 id、name、count）
         """
-        if provider == VectorDBProvider.MILVUS:
+        if provider == VectorDBProvider.MILVUS or provider == VectorDBProvider.MILVUS.value or str(provider).lower() == "milvus":
             try:
                 connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
-                collections = utility.list_collections()
+                collection_names = utility.list_collections()
+                collections: List[Dict[str, Any]] = []
+                for name in collection_names:
+                    try:
+                        collection = Collection(name)
+                        collections.append({
+                            "id": name,
+                            "name": name,
+                            "count": collection.num_entities
+                        })
+                    except Exception as e:
+                        logger.error(f"Error getting info for collection {name}: {str(e)}")
                 return collections
             finally:
                 connections.disconnect("default")
+        if str(provider).lower() == "chroma":
+            try:
+                base_dir = os.path.join("03-vector-store", "chroma")
+                if not os.path.exists(base_dir):
+                    return []
+                collections: List[Dict[str, Any]] = []
+                for fname in os.listdir(base_dir):
+                    if fname.endswith('.json'):
+                        file_path = os.path.join(base_dir, fname)
+                        try:
+                            with open(file_path, 'r', encoding='utf-8') as f:
+                                data = json.load(f)
+                            name = os.path.splitext(fname)[0]
+                            count = len(data.get("records", []))
+                            collections.append({
+                                "id": name,
+                                "name": name,
+                                "count": count
+                            })
+                        except Exception as e:
+                            logger.error(f"Error reading chroma collection file {fname}: {str(e)}")
+                return collections
+            except Exception as e:
+                logger.error(f"Error listing chroma collections: {str(e)}")
+                return []
         return []
 
     def delete_collection(self, provider: str, collection_name: str) -> bool:
@@ -321,13 +420,23 @@ class VectorStoreService:
         返回:
             是否删除成功
         """
-        if provider == VectorDBProvider.MILVUS:
+        if provider == VectorDBProvider.MILVUS or provider == VectorDBProvider.MILVUS.value or str(provider).lower() == "milvus":
             try:
                 connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
                 utility.drop_collection(collection_name)
                 return True
             finally:
                 connections.disconnect("default")
+        if str(provider).lower() == "chroma":
+            try:
+                file_path = os.path.join("03-vector-store", "chroma", f"{collection_name}.json")
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    return True
+                return False
+            except Exception as e:
+                logger.error(f"Error deleting chroma collection {collection_name}: {str(e)}")
+                return False
         return False
 
     def get_collection_info(self, provider: str, collection_name: str) -> Dict[str, Any]:
@@ -341,7 +450,7 @@ class VectorStoreService:
         返回:
             集合信息字典
         """
-        if provider == VectorDBProvider.MILVUS:
+        if provider == VectorDBProvider.MILVUS or provider == VectorDBProvider.MILVUS.value or str(provider).lower() == "milvus":
             try:
                 connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
                 collection = Collection(collection_name)
@@ -352,4 +461,24 @@ class VectorStoreService:
                 }
             finally:
                 connections.disconnect("default")
+        if str(provider).lower() == "chroma":
+            try:
+                file_path = os.path.join("03-vector-store", "chroma", f"{collection_name}.json")
+                if not os.path.exists(file_path):
+                    return {}
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                return {
+                    "name": data.get("name", collection_name),
+                    "num_entities": len(data.get("records", [])),
+                    "schema": {
+                        "vector_dimension": data.get("vector_dimension", 0),
+                        "embedding_provider": data.get("embedding_provider", ""),
+                        "embedding_model": data.get("embedding_model", ""),
+                        "created_at": data.get("created_at", "")
+                    }
+                }
+            except Exception as e:
+                logger.error(f"Error getting chroma collection info {collection_name}: {str(e)}")
+                return {}
         return {}

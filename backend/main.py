@@ -271,6 +271,11 @@ async def get_providers():
     try:
         search_service = SearchService()
         providers = search_service.get_providers()
+        # 增加 Chroma 提供商
+        # 避免重复添加
+        existing_ids = {p.get("id") for p in providers}
+        if "chroma" not in existing_ids:
+            providers.append({"id": "chroma", "name": "Chroma"})
         return {"providers": providers}
     except Exception as e:
         logger.error(f"Error getting providers: {str(e)}")
@@ -281,12 +286,12 @@ async def get_providers():
 
 @app.get("/collections")
 async def get_collections(
-    provider: VectorDBProvider = Query(default=VectorDBProvider.MILVUS)
+    provider: str = Query(default=VectorDBProvider.MILVUS.value)
 ):
     """获取指定向量数据库中的集合"""
     try:
-        search_service = SearchService()
-        collections = search_service.list_collections(provider.value)
+        vector_store_service = VectorStoreService()
+        collections = vector_store_service.list_collections(provider)
         return {"collections": collections}
     except Exception as e:
         logger.error(f"Error getting collections: {str(e)}")
@@ -301,12 +306,16 @@ async def search(
     collection_id: str = Body(...),
     top_k: int = Body(3),
     threshold: float = Body(0.7),
-    word_count_threshold: int = Body(100)
+    word_count_threshold: int = Body(100),
+    provider: str = Body(default=VectorDBProvider.MILVUS.value),
+    save_results: bool = Body(False)
 ):
     """执行向量搜索"""
     try:
         # Log the incoming search request details
-        logger.info(f"Search request - Query: {query}, Collection: {collection_id}, Top K: {top_k}, Threshold: {threshold}, Word Count Threshold: {word_count_threshold}")
+        logger.info(
+            f"Search request - Query: {query}, Collection: {collection_id}, Top K: {top_k}, Threshold: {threshold}, Word Count Threshold: {word_count_threshold}, Provider: {provider}, Save Results: {save_results}"
+        )
         
         search_service = SearchService()
         
@@ -318,7 +327,8 @@ async def search(
             collection_id=collection_id,
             top_k=top_k,
             threshold=threshold,
-            word_count_threshold=word_count_threshold
+            word_count_threshold=word_count_threshold,
+            save_results=save_results
         )
         
         # Log the search results
@@ -968,4 +978,4 @@ async def get_search_result(file_id: str):
             
     except Exception as e:
         logger.error(f"Error reading search result file: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))
